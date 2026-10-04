@@ -73,7 +73,7 @@ def _parse_scalar(value: str) -> object:
             return []
         return [_parse_scalar(item) for item in _split_items(inner)]
     if len(value) > 1 and value[0] == value[-1] and value[0] in ("'", '"'):
-        return value[1:-1]
+        return _unescape_quoted(value[1:-1], value[0])
     lowered = value.lower()
     if lowered == _TRUE:
         return True
@@ -91,13 +91,43 @@ def _parse_scalar(value: str) -> object:
         return value
 
 
+def _unescape_quoted(inner: str, quote: str) -> str:
+    """Undo the escaping _render_scalar applies inside a quoted value.
+
+    Only the quote character itself and the backslash are escape-significant;
+    anything else keeps its literal backslash (e.g. "\\n" stays backslash-n).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(inner)
+    while i < n:
+        char = inner[i]
+        if char == "\\" and i + 1 < n and inner[i + 1] in (quote, "\\"):
+            out.append(inner[i + 1])
+            i += 2
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
 def _split_items(inner: str) -> list[str]:
     items: list[str] = []
     current: list[str] = []
     quote: str | None = None
     at_value_start = True
-    for char in inner:
+    i = 0
+    n = len(inner)
+    while i < n:
+        char = inner[i]
         if quote:
+            if char == "\\" and i + 1 < n and inner[i + 1] in (quote, "\\"):
+                # Escaped quote or backslash: literal, must not toggle quote mode.
+                current.append(char)
+                current.append(inner[i + 1])
+                i += 2
+                at_value_start = False
+                continue
             if char == quote:
                 quote = None
             current.append(char)
@@ -111,16 +141,25 @@ def _split_items(inner: str) -> list[str]:
             current = []
             at_value_start = True
         elif char in (" ", "\t"):
-            if not current:
-                at_value_start = True
-            else:
+            if current:
                 current.append(char)
                 at_value_start = False
         else:
             current.append(char)
             at_value_start = False
+        i += 1
+    if quote is not None:
+        # Unbalanced quote: treat every quote as a literal character and
+        # fall back to a plain comma split rather than swallowing the list.
+        return [item for item in (item.strip() for item in inner.split(",")) if item]
     items.append("".join(current))
     return [item for item in (item.strip() for item in items) if item]
+
+
+def _looks_like_non_string(text: str) -> bool:
+    """True when the reader would not hand this unquoted text back as a string."""
+    probe = _parse_scalar(text)
+    return not isinstance(probe, str) or probe != text
 
 
 def _render_scalar(value: object) -> str:
@@ -133,6 +172,12 @@ def _render_scalar(value: object) -> str:
     if isinstance(value, (int, float)):
         return repr(value)
     text = str(value)
-    if text != text.strip() or any(char in text for char in ":#[]{},") or text == "":
-        return '"' + text.replace('"', '\\"') + '"'
+    if (
+        text == ""
+        or text != text.strip()
+        or text[:1] in ("'", '"')  # a leading quote would open quote mode in lists
+        or any(char in text for char in ":#[]{},")
+        or _looks_like_non_string(text)
+    ):
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
     return text
